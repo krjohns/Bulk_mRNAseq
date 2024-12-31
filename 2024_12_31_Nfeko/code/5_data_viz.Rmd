@@ -1,0 +1,1519 @@
+### Title: 20230925 Intercellular DCT RNA-seq with Glutamate Inhibitors
+### Author: Kate Johnson
+### Date: 09/30/2024
+### Add'tl Notes:
+
+# setup
+libraries
+```{r}
+# all-purpose data analysis tools
+library(tidyverse)
+# ggplot extension
+library(cowplot)
+# repeling labels in ggplot
+library(ggrepel)
+#correlation plots
+library(corrplot)
+# easier string formatting
+library(glue)
+# filepath manipulation
+library(fs)
+
+# edgeR and limma for DE analysis
+library(edgeR)
+library(limma)
+
+# for reading/writing .gct files
+#library(cmapR)
+
+# for working with matrices (especially sparse ones)
+library(Matrix)
+
+#complex heatmap /plotting
+library(ComplexHeatmap)
+library(circlize) #for colorRamp2 color scaling
+library(monochromeR) # for generating palettes
+library(ggpubr) #arranging plots, stat_cor()
+library(emojifont) #for help rendering unicode text
+
+#GSEA
+library(clusterProfiler)
+library(enrichplot)
+
+# SET THE DESIRED ORGANISM HERE
+organism = "org.Mm.eg.db"
+#BiocManager::install(organism, character.only = TRUE)
+library(organism, character.only = TRUE)
+```
+theme
+```{r}
+# Plot settings ----
+#compress PDFs
+tools::compactPDF('mypdfs/',  gs_quality='screen')
+###PLOTTING THEME ###
+theme_update(text = element_text(size = rel(4)),
+             legend.title = element_text(size = rel(2.5)),
+             legend.key.size = unit(.1, 'inches'),
+             legend.text = element_text(size = rel(2)),
+             panel.background = element_rect(fill = "white", colour = "black"),
+             axis.line = element_blank(),
+             axis.text.x = element_text(size=rel(3)),
+             axis.text.y = element_text(size=rel(3)),
+             axis.title.y = element_text(margin=margin(t = 0.5, r = 0.5, 
+                                                       b = 0.5, l = 0.5), size=rel(3)),
+             axis.title.x = element_text(size=rel(3)),
+             plot.title = element_text(size = rel(3), face= "bold", hjust=0.5),
+             plot.margin = unit(c(0.08, 0.1, 0.01, 0.01), "inches"),
+             strip.text.x = element_text(size = rel(3), face = "bold", margin = margin(0.05,0.05,0.05,0.05, "cm")),
+             strip.text.y = element_text(size = rel(3), face = "bold", margin = margin(0.05,0.05,0.05,0.05, "cm")),
+             strip.background = element_rect(linewidth=0.35, color="black"),
+             legend.key = element_rect(colour = NA, fill = NA)) #trbl
+```
+
+
+directories
+```{r}
+wd = getwd()
+# For reading in counts/metadata
+input_dir = path(wd, "../input/data/2_formatted_data")
+# For saving plots  
+output_dir = path(wd, "../output")
+
+```
+
+sources
+```{r}
+
+```
+
+
+# Read in Data
+```{r, warnings =F}
+#counts
+counts = read_csv(path(input_dir, "20240925_GluDrug_DCT_counts.csv")) 
+#rename gene column
+colnames(counts)[1] = "gene"
+# format matrix to be ready for de analysis
+genes <- counts$gene
+counts$gene <- NULL
+rownames(counts) <- genes
+
+#meta        
+metadata = read_csv(path(input_dir, "20240925_GluDrug_DCT_metadata.csv")) %>%
+           #drop unused first col
+           select(-1) %>%
+           #refactor relevant columns
+           mutate(Sample = gsub("[+]", ".", str_c(Treatment, "_" , Drug_abbrev_conc,
+                                                  "__", Cell_type, "_", Time)),
+                  Sample_Rep = gsub("[+]", ".", str_c(Sample, ".", Replicate)),
+                  Time = factor(Time, levels = c("4h", "24h", "72h")),
+                  Drug_type = factor(Drug_type, levels = c("None", "Single", "Pair")),
+                  Concentration = ifelse(is.na(Concentration), "None", Concentration),
+                  Concentration = factor(Concentration, levels = c("None","Lo", "Hi")),
+                  Target_type = factor(Target_type, levels = c("None", "Transport Inhibitor", 
+                                  "Receptor Inhibitor", "Transport Inhibitor (multi-drug)",
+                                  "Receptor Inhibitor (multi-drug)",
+                                  "Transport + Receptor Inhibitor")),
+                  Drug = factor(Drug, levels = unique(Drug)),
+                  Sample = factor(Sample, levels = unique(Sample)),
+                  Replicate = as.character(Replicate)) %>%
+           #filter out wells with known missing samples
+           filter(!(Cell_type == "BMDC" & Time == "24h" & 
+                      Well %in% c("C_P2_04", "D_P2_04", "E_P2_04")))
+
+#remove plus signs from colnames to avoid subsequent issues
+colnames(counts) = gsub("_Tcell","__Tcell",gsub("_BMDC","__BMDC",gsub("[+]", ".", colnames(counts))))
+counts_filt = counts[,metadata$Sample_Rep]
+rownames(counts_filt) <- genes
+ 
+```
+# QC
+Data Normalization
+```{r}
+#set cpm thresholds (keep low to start)
+cpm_threshold = 15
+cpm_needed = 2
+
+groups <- factor(metadata$Sample)
+dge = DGEList(counts = counts_filt, group = groups)
+dge_norm = calcNormFactors(dge)
+#require cpm>15 in at least 2 samples within BMDC samples or 2 within Tcell samples (stricter)
+isexpr = (rowSums(cpm(dge_norm[,grepl("BMDC",colnames(dge_norm))]) > cpm_threshold) >= cpm_needed) | (rowSums(cpm(dge_norm[,grepl("Tcell",colnames(dge_norm))]) > cpm_threshold) >= cpm_needed)
+  
+dge_norm_fltd = dge_norm[isexpr, ]
+
+cpm = cpm(dge_norm_fltd) #dropped to ~20k for cpms10, ~15k for cpms15 (all samples),
+                          #~15776 for strictest
+cpm_all = cpm(dge_norm)
+
+#save cpm heatmaps for plotting in morpheus
+#write.csv(as.matrix(cpm), path(output_dir, "cpm_tables/cpms15/DC2orT2/20240925_cpmTable_filt.csv"))
+#write.csv(as.matrix(cpm_all), path(output_dir, "cpm_tables/20240925_cpmTable_all.csv"))
+
+```
+
+PCA
+```{r}
+# run pca
+pca = prcomp(t(cpm), center=T, scale=T)
+# combine pca results with metadata for easy plotting
+pca_res = bind_cols(metadata, as_tibble(pca$x)) %>%
+          mutate(Time = factor(Time, levels = c("4h", "24h", "72h"))) %>%
+          rename("time(h)" ="Time") %>%
+          mutate(Control = ifelse(Drug == "None", 
+                           str_c(Treatment, "_", `time(h)`), "other"), 
+                 .after = Sample,
+                 Control = factor(Control,
+                        levels = c("Control_4h", "Control_24h", "Control_72h",
+                                   "LSG_4h", "LSG_24h", "LSG_72h", "other")),
+                 Punctured = ifelse(Cell_type == "Tcell" &
+                                      `time(h)` == "4h" & 
+                                      Well %in% c("A_P1_01", "A_P1_02"),
+                                    "Punctured", "other"),
+                 AAA = ifelse(grepl("AAA", Drug),
+                              as.character(Drug), 
+                              "other"),
+                 Erastin = ifelse(grepl("Erastin", Drug),
+                              as.character(Drug), 
+                              "other"),
+                 Cerestat = ifelse(grepl("Cerestat", Drug),
+                              as.character(Drug), 
+                              "other"),
+                 `D-AP5` = ifelse(grepl("D-AP5", Drug),
+                              as.character(Drug), 
+                              "other"),
+                 Drug = factor(Drug, levels = unique(Drug)))
+
+# plot
+# color by treatment
+p1<-ggplot(pca_res, aes(PC1, PC2, fill=Treatment)) + 
+    geom_point(size=3, shape =21, color = "black") +
+    scale_fill_manual(values = c("grey", "#F68064")) +
+    theme(text = element_text(size=6),
+          legend.position = "top")
+p1
+# color by timepoint
+p2<-ggplot(pca_res, aes(PC1, PC2, fill=`time(h)`)) + 
+    geom_point(size=3, shape = 21, color = "black") +
+    scale_fill_manual(values = c("grey95",  "grey55","grey20"))+
+    theme(text = element_text(size=6),
+          legend.position = "top")
+p2
+# color by replicate
+p3<-ggplot(pca_res, aes(PC1, PC2, fill=Replicate)) + 
+    geom_point(size=3, shape =21, color = "black") +
+    theme(text = element_text(size=6),
+          legend.position = "top")
+p3
+
+p4<-ggplot(pca_res, aes(PC1, PC2, fill=Cell_type)) + 
+    geom_point(size=3, shape =21, color = "black") +
+    scale_fill_manual(values = c( "#8C9FCA", "#68C3A5"))+
+    theme(text = element_text(size=6),
+          legend.position = "top")
+p4
+
+#Drug_type
+p5<-ggplot(pca_res, aes(PC1, PC2, fill=Drug_type)) + 
+    geom_point(size=3, shape =21, color = "black") +
+    scale_fill_manual(values = c("white" ,"#C0ACD0", "mediumorchid4"))+
+    theme(text = element_text(size=6),
+          legend.position = "top")
+p5
+
+#Target_type
+p6<-ggplot(pca_res, aes(PC1, PC2, fill=Target_type)) + 
+    geom_point(size=3, shape =21, color = "black") +
+    #scale_fill_manual(values = c("white" ,"#C0ACD0", "mediumorchid4"))+
+    theme(text = element_text(size=3),
+          legend.position = "top") +
+    guides(fill = guide_legend(nrow=3))
+
+p6
+
+p7<-ggplot(pca_res, aes(PC1, PC2, fill=Concentration)) + 
+    geom_point(size=3, shape =21, color = "black") +
+    #scale_fill_manual(values = c("white" ,"#C0ACD0", "mediumorchid4"))+
+    theme(text = element_text(size=6),
+          legend.position = "top") 
+p7
+
+p8<-ggplot(pca_res, aes(PC1, PC2, fill=DMSO)) + 
+    geom_point(size=3, shape =21, color = "black") +
+    #scale_fill_manual(values = c("white" ,"#C0ACD0", "mediumorchid4"))+
+    theme(text = element_text(size=6),
+          legend.position = "top") 
+p8
+
+p9<-ggplot(pca_res, aes(PC1, PC2, fill=Drug)) + 
+    geom_point(size=0.5, shape =21, color = "black") +
+    #scale_fill_manual(values = c("white" ,"#C0ACD0", "mediumorchid4"))+
+    theme(text = element_text(size=2),
+          legend.position = "top") +
+    guides(fill = guide_legend(nrow=5))
+p9
+
+p10<-ggplot(pca_res, aes(PC1, PC2, color= Control)) + 
+    geom_point(data = pca_res %>% filter(Control == "other"), size=1.2) +
+    geom_point(data = pca_res %>% filter(Control != "other"), size=1.2) +
+    scale_color_manual(values = c( "grey95", "#A6DFF7", "#AED29E", "#5BABA4",
+                                   "#F4908E", "#D278AE", "#9E7FB8"))+
+    theme(text = element_text(size=4),
+          legend.position = "top") +
+    guides(color = guide_legend(nrow=2))
+p10
+
+
+p11<-ggplot(pca_res, aes(PC1, PC2, color= Punctured)) + 
+    geom_point(data = pca_res %>% filter(Punctured == "other"), size=1.2) +
+    geom_point(data = pca_res %>% filter(Punctured != "other"), size=1.2) +
+    scale_color_manual(values = c( "grey95", "#A6DFF7"))+
+    theme(text = element_text(size=4),
+          legend.position = "top") +
+    guides(color = guide_legend(nrow=2))
+#put various volor designs together into one plot
+grid <-ggarrange(p5,p6,p7,p8, nrow=1)
+
+grid
+# save plots
+save_plot(path(output_dir, "QC_plots/PCA/Filt_samples/cpms15/cpms15_2BMDC_or2T/PCA_controls.pdf"),
+          p10,dpi=90, base_aspect_ratio =1.2)
+save_plot(path(output_dir, "QC_plots/PCA/Filt_samples/cpms15/cpms15_2BMDC_or2T/Targettype_drugtype_DMSO_conc.pdf"),grid,base_aspect_ratio =4,dpi=90)
+
+```
+
+#iterate by treatment group and grey out other treatments for better viz of PCA...
+```{r}
+
+A<-ggplot(pca_res, aes(PC1, PC2, color= AAA)) + 
+    geom_point(data = pca_res %>% filter(AAA == "other"), size=1.2) +
+    geom_point(data = pca_res %>% filter(AAA != "other"), size=1.2) +
+    scale_color_manual(values = c( "#A6DFF7", "#5BABA4", "#AED29E",
+                                   "#EED290", "#F68064", "#F29D65",
+                                   "grey95"))+
+    theme(text = element_text(size=3),
+          legend.position = "top") +
+    guides(color = guide_legend(nrow=3))
+E<-ggplot(pca_res, aes(PC1, PC2, color= Erastin)) + 
+    geom_point(data = pca_res %>% filter(Erastin == "other"), size=1.2) +
+    geom_point(data = pca_res %>% filter(Erastin != "other"), size=1.2) +
+    scale_color_manual(values = c( "#A6DFF7", "#5BABA4", "#AED29E",
+                                   "#EED290", "#F68064", 
+                                   "grey95"))+
+    theme(text = element_text(size=3),
+          legend.position = "top") +
+    guides(color = guide_legend(nrow=3))
+
+C<-ggplot(pca_res, aes(PC1, PC2, color= Cerestat)) + 
+    geom_point(data = pca_res %>% filter(Cerestat == "other"), size=1.2) +
+    geom_point(data = pca_res %>% filter(Cerestat != "other"), size=1.2) +
+    scale_color_manual(values = c( "#A6DFF7", "#5BABA4", "#AED29E",
+                                   "#EED290", "#F68064", "#F29D65",
+                                   "grey95"))+
+    theme(text = element_text(size=3),
+          legend.position = "top") +
+    guides(color = guide_legend(nrow=3))
+
+D<-ggplot(pca_res, aes(PC1, PC2, color= `D-AP5`)) + 
+    geom_point(data = pca_res %>% filter(`D-AP5` == "other"), size=1.2) +
+    geom_point(data = pca_res %>% filter(`D-AP5` != "other"), size=1.2) +
+    scale_color_manual(values = c( "#A6DFF7", "#5BABA4", "#AED29E",
+                                   "#EED290", "#F68064", "#F29D65",
+                                   "grey95"))+
+    theme(text = element_text(size=3),
+          legend.position = "top") +
+    guides(color = guide_legend(nrow=3))
+
+grid <-ggarrange(A,E,C,D, nrow=1)
+grid
+save_plot(path(output_dir, "QC_plots/PCA/Filt_samples/cpms15/cpms15_2BMDC_or2T/Grid_by_drug_fam.pdf"),grid,base_aspect_ratio =4,dpi=90)
+```
+
+
+#check cell type markers
+make single cpm plots of relevant cell type markers
+```{r}
+Tcell_markers <-c("Cd28","Cd3d", "Cd3e", "Cd3g", "Cd4")
+BMDC_markers <-c("H2.Ab1", "Cd80", "Cd86", "Cd40", "Itgam" ,"Itgax")
+
+int <- c("Slc7a11", "Nfe2l1", "Nfe2l2", "Gls", "Gclc", "Gclcm", "Grina")
+cell_markers = cpm %>% 
+               data.frame() %>%
+               rownames_to_column(var = "Gene") %>%
+               filter(Gene %in% Tcell_markers | Gene %in% BMDC_markers |
+                        Gene %in% my_genes1 | Gene %in% glu_pathway$Gene |
+                        grepl("Il", Gene)| grepl("Fas|Bcl|Cxcl", Gene),
+                      Gene %in% int) %>%
+               pivot_longer(cols = -Gene, names_to = "sample", values_to = "cpm") %>%
+               separate(sample, into = c("Treatment", "Drug_abbrev", "Concentration",
+                                         "Cell_type", "Time"), sep = "_") %>%
+               separate(Time, into = c("Time", "Replicate"), sep = "[.]") %>%
+               rowwise() %>%
+               group_by(Gene, Cell_type, Treatment, Time, Drug_abbrev, Concentration) %>%
+               summarise(mean = mean(cpm),
+                         n = n(),
+                         se = sd(cpm)/sqrt(n)) %>%
+               ungroup() %>%
+               mutate(Drug_abbrev = gsub("[.]", "+", Drug_abbrev)) %>%
+               #merge w metadata
+               merge(metadata %>%
+                     #remove extraneous columns
+                     select(-c(Cell_type_barcode, Barcode, Well, Column, Row, IDT_plate, 
+                               RNA_plate, Sample_Rep, Replicate)),
+                     by = c("Cell_type", "Time", "Treatment", "Drug_abbrev", "Concentration")) %>%
+                    #remove duplicated rows inhereted from replicates             
+                unique() %>%
+               #format variables for better plotting
+               mutate(Time = as.numeric(gsub("h", "", Time)),
+                      Treatment_drug = str_c(Treatment, "_", Drug_abbrev),
+                      #collapse DMSO info into Concentration info
+                      #Concentration = ifelse(grepl("DMSO", Treatment_drug), "DMSO",
+                                            # as.character(Concentration)),
+                      Concentration = factor(Concentration, levels = c("None", "Lo", "Hi")),
+                      #strip DMSO info from drug names
+                      Treatment_drug = gsub("LSG_DMSO", "LSG_None", 
+                                        gsub("[+]DMSO", "", Treatment_drug)),
+                      #force order of drugs
+                      Treatment_drug = factor(Treatment_drug, 
+                                          levels = c("Control_None", "LSG_None",
+                                                     "LSG_A", "LSG_E", "LSG_C", "LSG_D",
+                                                     "LSG_A+C", "LSG_A+D", "LSG_E+C", "LSG_E+D",
+                                                     "LSG_A+E", "LSG_D+C")),
+                      Drug_short = gsub("[+]DMSO", "", gsub("^DMSO$","None",Drug_short)),
+                      Drug_type = ifelse(Drug_type == "Single" | Drug_type == "None", Drug_short, 
+                                    ifelse(Drug_abbrev %in% c("A+E", "D+C"), 
+                                           "Pair \n(Single Target)", 
+                                           "Pair \n(Dual Target)")),
+                      Drug_type = factor(Drug_type, 
+                                         levels = c("None", "AAA", "Erastin", 
+                                                    "Cerestat", "D-AP5",
+                                                     "Pair \n(Dual Target)", 
+                                                    "Pair \n(Single Target)"))) %>%
+                arrange(Cell_type, Time, Treatment, Treatment_drug, Concentration) %>%
+                mutate(Drug_short = factor(Drug_short, levels = unique(Drug_short)))
+
+#add duplicate control data to show in every plot panel
+controls = cell_markers %>%
+           filter(Treatment_drug == "LSG_None" & DMSO == F)
+
+for(i in 1:length(unique(cell_markers$Drug_type))){
+  #skip None group (controls already included)
+  if(i > 1){
+  #otherwise rbind duplicate data from control
+  cell_markers = cell_markers %>%
+                 rbind(controls %>% 
+                       mutate(Drug_type = as.character(unique(cell_markers$Drug_type)[i])))
+  }
+}
+
+my_genes1 = c("Cd40", "Cd80", "Cd86", "Cd40lg", "Ctla4", "Cd28")
+up <- c('Ears2','Gls', "Got2")
+down <- c("Eprs", "Gclc","Gclm", "Got1")
+
+#filter to cell type and genes of interest
+plot_me = cell_markers %>% 
+           filter(Gene %in% c("Gls", "Gclc")&
+                Cell_type == "BMDC")
+
+
+p<-ggplot(plot_me, 
+       aes(x = Time, 
+           y = mean, 
+           color = Treatment_drug,
+           alpha = Concentration,
+           linetype = DMSO)) +
+       geom_line(data = plot_me %>% filter(Drug == "None"), linewidth =0.8)+
+       geom_point(data = plot_me %>% filter(Drug == "None"),size=0.8)+
+       geom_line(data = plot_me %>% filter(Drug != "None"), linewidth =0.8)+
+       geom_point(data = plot_me %>% filter(Drug != "None"),size=0.8)+
+       scale_alpha_manual(values = c(1, 0.5, 1)) +
+       scale_color_manual(values = c("Control_None" = "grey", "LSG_None" = "black",
+                                     "LSG_A" = "#A6DFF7", "LSG_E" = "#B9CEE6",
+                                     "LSG_C" = "#8C9FCA", "LSG_D" = "#6D91CB",
+                                     "LSG_A+C" = "#5BABA4","LSG_A+D" = "#68C3A5",
+                                     "LSG_E+C" ="#539C84", "LSG_E+D" ="#3E7563",
+                                     "LSG_A+E" ="#9E7FB8", "LSG_D+C" ="#5E4C6E",
+                                     "#D278AE", "#871F78", "#C0ACD0")) +
+       labs(y="Average cpm") +
+       ggtitle(as.character(unique(plot_me$Cell_type))) +
+       geom_errorbar(data = plot_me %>% 
+                       filter(Drug == "None"),
+                     mapping=aes(ymax=mean+se, ymin=mean-se), 
+                     width = 10, linewidth =1) +
+       geom_errorbar(data = plot_me %>% 
+                       filter(Drug != "None"),
+                     mapping=aes(ymax=mean+se, ymin=mean-se), 
+                     width = 10, linewidth =1) +
+       ggh4x::facet_grid2(Drug_type~Gene, independent = "y",scales = "free") +
+       theme(legend.position = "none",
+             text = element_text(size=2))
+p
+
+save_plot(fs::path(output_dir,
+               str_c("single_gene_plots/Enzymes/", 
+                  unique(plot_me$Cell_type),"_Gls_Gclc_vertical.pdf")),p,
+          base_aspect_ratio = 0.5)         
+```
+
+
+#DE analysis# DE analysis
+The general steps for modeling are: 
+1. Filter cpm and metadata based on the analysis at hand
+2. Make a design matrix specifying the experimental condition of each sample 
+3. Run `voom()` to transform and prepare data
+4. Run initial `lmFit()` to fit data
+5. Setup contrasts between groups for tests you want to run
+    1. List contrasts
+    2. Make contrast matrix
+6. Run `contrast.fit()` to fit contrasts
+7. Run `eBayes` to estimate statistic results
+8. Gather results into useful tables
+
+```{r}
+# repeat dge list creation here in case filtering is necessary of counts table after QC
+  #for now including all samples so this is redundant
+# set cpm thresholds (keep low to start)
+cpm_threshold = 20 #X
+cpm_needed = 5 #Y
+
+
+## re-do dge list object creation using adjusted counts table
+groups <- factor(metadata$Sample)
+dge = DGEList(counts = counts_filt, group = groups)
+dge_norm = calcNormFactors(dge)
+
+#require cpm>X in at least Y samples
+isexpr = rowSums(cpm(dge_norm) > cpm_threshold) >= cpm_needed
+dge_norm_fltd = dge_norm[isexpr, ]
+
+
+# DESIGN MATRIX----
+# create factor with all conditions in experiment
+f <- factor(groups, levels=unique(groups))
+
+# build a design matrix for modeling with limma voom and indicating condition for each sample
+design <- model.matrix(~0 + f)
+
+# renames column names in the design (remove extra "f" at beginning of each group name)
+colnames(design) <- sub("f", "", colnames(design))
+rownames(design) <- colnames(counts_filt)
+
+##LIMMA VOOM 
+# limma voom transforms count data to log2-counts per million (log2-cpm) with associated weights
+# estimate the mean-variance relationship and use this to compute appropriate observational-level weights.
+# The data are then ready for linear modeling.
+y <- voom(dge_norm_fltd, design, plot=T)
+
+# fit linear model for each gene given a series of arrays
+fit <- lmFit(y, design)
+
+##CONTRAST MATRIX----
+# to start compute all contrasts as each treatment relative to No Drug/OVA only control at each timepoint
+# 1. get all treatments that arent control
+# 2. subtract each sample from its time matched control
+all_cond = levels(groups)[!grepl("Control_None_None", (levels(groups)))]
+#time/celltype match each condition to control
+contrasts_list = str_c(all_cond, " - Control_None_None__", 
+                       #strip everything but celltype and time
+                        gsub(".*__", "", all_cond))
+
+contrast.matrix <- makeContrasts(contrasts = contrasts_list, levels = design)
+
+#do some renaming of scores to facilitate pivoting later on and make our lives easier...
+contrast.matrix = contrast.matrix %>%
+                  as.data.frame %>% #convert to df for now for manipulation
+                  rename_with(., ~gsub(" - .*", "", .)) %>%
+                  as.matrix()
+
+fit.cont <- contrasts.fit(fit, contrast.matrix)
+e.fit <- eBayes(fit.cont)
+
+#first bind together all LFC lists for all genes from ea. contrast
+log2FC.all = as.data.frame(map_dfc(1:length(colnames(e.fit$contrasts)),
+                             function(coef) topTable(e.fit, coef=coef, number=Inf, adjust = "BH",
+                                                     sort.by='none')$logFC)) %>%
+      data.frame()
+
+adj_p = as.data.frame(map_dfc(1:length(colnames(e.fit$contrasts)),
+                                    function(coef) topTable(e.fit, coef=coef, adjust = "BH",
+                                                            number=Inf,
+                                                            sort.by='none')$adj.P.Val))
+
+rownames(log2FC.all) = rownames(adj_p) = make.unique(rownames(dge_norm_fltd), sep = ".")
+colnames(log2FC.all) = colnames(adj_p) = colnames(e.fit$contrasts)
+
+#turn log2FC.all.binary into matrix of -1,0,1
+FDR_thresh = 0.01
+log2FC.all.binary = adj_p %>%
+              mutate_all(~ifelse(. < FDR_thresh, 1, 0))
+
+#filter LFC matrix accordingly
+log2FC.all.binary[(log2FC.all < 0) == T] = -1 * log2FC.all.binary[(log2FC.all < 0) == T]
+names = rownames(log2FC.all.binary)
+log2FC.all.binary = log2FC.all.binary %>%
+                    data.frame()
+
+DE_log2FC.all = log2FC.all[rowSums(log2FC.all.binary != 0) > 0,] %>%
+          data.frame()
+rownames(DE_log2FC.all) = rownames(log2FC.all)[rowSums(log2FC.all.binary != 0) > 0]
+
+BMDC_fdr_sig = log2FC.all %>% 
+               select(contains("BMDC")) %>%
+               filter(rowSums(log2FC.all.binary[,1:57] != 0) > 0)
+
+T_fdr_sig = log2FC.all %>% 
+            select(contains("Tcell")) %>%
+            filter(rowSums(log2FC.all.binary[,58:114] != 0) > 0)
+
+#filter DE matrix based on LFC thresh
+LFC_thresh = 1
+DE_LFC_thresh = DE_log2FC.all %>%
+          filter_all(any_vars(abs(.) > LFC_thresh))
+
+BMDC_fdr_lfc_sig = BMDC_fdr_sig %>%
+                   filter_all(any_vars(abs(.) > LFC_thresh))
+
+T_fdr_lfc_sig = T_fdr_sig %>%
+                   filter_all(any_vars(abs(.) > LFC_thresh))
+
+#zero non-sig genes (?)
+#merge BMDC and T
+BMDC_T_DE_merge = BMDC_fdr_lfc_sig %>%
+                  rownames_to_column("gene") %>%
+                  full_join(T_fdr_lfc_sig %>% rownames_to_column("gene"), by = "gene") %>%
+                  #zero out missing genes in each cell_type
+                  mutate_all(~ifelse(is.na(.), 0,.)) 
+
+
+#save tables
+write.csv(as.matrix(BMDC_T_DE_merge), path(output_dir,                               "DE_analysis/OVA_NoDrug/FDR0.01_LFC1/DCT_merge_LFC_matrix.csv"))
+
+write.csv(as.matrix(log2FC.all.binary),
+          path(output_dir,                         "DE_analysis/OVA_NoDrug/FDR0.01_LFC1/20241003KJ_FDR0.01_LFC1_cpm20_DE-genes-binary-matrix.csv"))
+```
+
+#repeat DE analysis but using LSG treated No Drug Sample as baseline
+```{r}
+##CONTRAST MATRIX----
+# to start compute all contrasts as each treatment relative to No Drug/OVA only control at each timepoint
+# 1. get all treatments that arent control
+# 2. subtract each sample from its time matched control
+all_cond = levels(groups)[!grepl("Control_None_None", (levels(groups)))]
+all_cond2 = all_cond[!grepl("LSG_None_None", all_cond)]
+#time/celltype match each condition to control
+contrasts_list = str_c(all_cond2, " - LSG_None_None__", 
+                       #strip everything but celltype and time
+                        gsub(".*__", "", all_cond2))
+
+contrast.matrix <- makeContrasts(contrasts = contrasts_list, levels = design)
+
+#do some renaming of scores to facilitate pivoting later on and make our lives easier...
+contrast.matrix = contrast.matrix %>%
+                  as.data.frame %>% #convert to df for now for manipulation
+                  rename_with(., ~gsub(" - .*", "", .)) %>%
+                  as.matrix()
+
+fit.cont <- contrasts.fit(fit, contrast.matrix)
+e.fit <- eBayes(fit.cont)
+
+#first bind together all LFC lists for all genes from ea. contrast
+log2FC.all = as.data.frame(map_dfc(1:length(colnames(e.fit$contrasts)),
+                             function(coef) topTable(e.fit, coef=coef, number=Inf, adjust = "BH",
+                                                     sort.by='none')$logFC)) %>%
+      data.frame()
+
+adj_p = as.data.frame(map_dfc(1:length(colnames(e.fit$contrasts)),
+                                    function(coef) topTable(e.fit, coef=coef, adjust = "BH",
+                                                            number=Inf,
+                                                            sort.by='none')$adj.P.Val))
+
+rownames(log2FC.all) = rownames(adj_p) = make.unique(rownames(dge_norm_fltd), sep = ".")
+colnames(log2FC.all) = colnames(adj_p) = colnames(e.fit$contrasts)
+
+#turn log2FC.all.binary into matrix of -1,0,1
+FDR_thresh = 0.05
+log2FC.all.binary = adj_p %>%
+              mutate_all(~ifelse(. < FDR_thresh, 1, 0))
+
+#filter LFC matrix accordingly
+log2FC.all.binary[(log2FC.all < 0) == T] = -1 * log2FC.all.binary[(log2FC.all < 0) == T]
+names = rownames(log2FC.all.binary)
+log2FC.all.binary = log2FC.all.binary %>%
+                    data.frame()
+
+DE_log2FC.all = log2FC.all[rowSums(log2FC.all.binary != 0) > 0,] %>%
+          data.frame()
+rownames(DE_log2FC.all) = rownames(log2FC.all)[rowSums(log2FC.all.binary != 0) > 0]
+
+BMDC_fdr_sig = log2FC.all %>% 
+               select(contains("BMDC")) %>%
+               filter(rowSums(log2FC.all.binary[,1:54] != 0) > 0)
+
+T_fdr_sig = log2FC.all %>% 
+            select(contains("Tcell")) %>%
+            filter(rowSums(log2FC.all.binary[,55:108] != 0) > 0)
+
+#filter DE matrix based on LFC thresh
+LFC_thresh = 1
+DE_LFC_thresh = DE_log2FC.all %>%
+          filter_all(any_vars(abs(.) > LFC_thresh))
+
+BMDC_fdr_lfc_sig = BMDC_fdr_sig %>%
+                   filter_all(any_vars(abs(.) > LFC_thresh))
+
+T_fdr_lfc_sig = T_fdr_sig %>%
+                   filter_all(any_vars(abs(.) > LFC_thresh))
+
+#zero non-sig genes (?)
+#merge BMDC and T
+BMDC_T_DE_merge = BMDC_fdr_lfc_sig %>%
+                  rownames_to_column("gene") %>%
+                  full_join(T_fdr_lfc_sig %>% rownames_to_column("gene"), by = "gene") %>%
+                  #zero out missing genes in each cell_type
+                  mutate_all(~ifelse(is.na(.), 0,.)) 
+
+
+#plot DEGs per sample
+#code is slow -- find way to do this better?
+stats = log2FC.all.binary %>%
+        #rowwise() %>% #try using reframe ..?
+        reframe(up = colSums(.>0),
+                down = colSums(.<0)) %>%
+        mutate(Sample = colnames(log2FC.all.binary)) %>%
+        left_join(metadata %>% select(-c(Replicate, Sample_Rep, 
+                                         Barcode, Column, Row, Well, 
+                                         Cell_type_barcode)), by = "Sample") %>%
+        pivot_longer(cols = c("up", "down"), names_to = "DEG", values_to = "count") %>%
+        mutate(Treatment_drug = str_c(Treatment, "_", Drug_abbrev),
+                #collapse DMSO info into Concentration info
+                #Concentration = ifelse(grepl("DMSO", Treatment_drug), "DMSO",
+                # as.character(Concentration)),
+                      Concentration = factor(Concentration, levels = c("None", "Lo", "Hi")),
+                      #strip DMSO info from drug names
+                      Treatment_drug = gsub("LSG_DMSO", "LSG_None", 
+                                        gsub("[+]DMSO", "", Treatment_drug)),
+                      #force order of drugs
+                      Treatment_drug = factor(Treatment_drug, 
+                                          levels = c("Control_None", "LSG_None",
+                                                     "LSG_A", "LSG_E", "LSG_C", "LSG_D",
+                                                     "LSG_A+C", "LSG_A+D", "LSG_E+C", "LSG_E+D",
+                                                     "LSG_A+E", "LSG_D+C")),
+                      #Drug_short = gsub("[+]DMSO", "", gsub("^DMSO$","None",Drug_short)),
+                      Drug_type = ifelse(Drug_type == "Single" | Drug_type == "None",
+                                         gsub("[+]DMSO", "", gsub("^DMSO$","None",Drug_short)), 
+                                    ifelse(Drug_abbrev %in% c("A+E", "D+C"), 
+                                           "Pair \n(Single Target)", 
+                                           "Pair \n(Dual Target)")),
+                      Drug_type = factor(Drug_type, 
+                                         levels = c("None", "AAA", "Erastin", 
+                                                    "Cerestat", "D-AP5",
+                                                     "Pair \n(Dual Target)", 
+                                                    "Pair \n(Single Target)"))) %>%
+                filter(Cell_type == "Tcell") %>%
+                arrange(Cell_type, Treatment_drug, DMSO, Concentration ,desc(Time),count) %>%
+                mutate(Drug_short_conc = factor(Drug_short_conc, levels = unique(Drug_short_conc))) %>%
+                unique()
+
+p<-ggplot(stats, aes(x = Drug_short_conc, y= count, fill = Treatment_drug, alpha = Concentration)) +
+  geom_col(data = stats %>% filter(DEG == "up"), 
+           color = "black", position = position_dodge2(preserve = "single", width = 1)) +
+  geom_col(data = stats %>% filter(DEG == "down"), aes(y = -count), 
+           position = position_dodge2(preserve = "single", width = 1), 
+           color = "black") +
+  #scale_alpha_manual(values = c(1,0.5,1)) +
+  scale_fill_manual(values = c("Control_None" = "grey", "LSG_None" = "grey",
+                                     "LSG_A" = "#A6DFF7", "LSG_E" = "#B9CEE6",
+                                     "LSG_C" = "#8C9FCA", "LSG_D" = "#6D91CB",
+                                     "LSG_A+C" = "#5BABA4","LSG_A+D" = "#68C3A5",
+                                     "LSG_E+C" ="#539C84", "LSG_E+D" ="#3E7563",
+                                     "LSG_A+E" ="#9E7FB8", "LSG_D+C" ="#5E4C6E",
+                                     "#D278AE", "#871F78", "#C0ACD0")) +
+  facet_grid(Time~Drug_type, scales = "free") +
+  #ggh4x::facet_grid2(Time~Drug_type, independent = "y", scales = "free") +
+  labs(x = NULL, y = "Number DEGs", title = "Tcells") +
+  theme(axis.text.x = element_text(angle=45, hjust=1, size = rel(2.7)),
+        strip.text = element_text(size=rel(0.6)),
+        legend.position = "none") +
+      guides(fill=guide_legend(nrow=5))
+
+#saveplot
+save_plot(path(output_dir, "DE_analysis/LSG_NoDrug/FDR0.05_LFC1/DEGs_TCells.pdf"), p, 
+          base_aspect_ratio =1.6)
+
+#save tables
+write.csv(as.matrix(BMDC_T_DE_merge), path(output_dir,                               "DE_analysis/LSG_NoDrug/FDR0.05_LFC1/DCT_merge_LFC_matrix.csv"))
+write.csv(as.matrix(log2FC.all.binary),
+          path(output_dir,                         "DE_analysis/LSG_NoDrug/FDR0.05_LFC1/20241003KJ_FDR0.05_LFC1_cpm20_DE-genes-binary-matrix.csv"))
+```
+
+
+#complex heatmap
+#complex heatmap plot fxn
+move to plotting functions!
+```{r}
+do_plot = function(file_name, w, h, p) {
+  pdf(file=fs::path(output_dir, file_name), width = w, height = h)
+      draw(p)
+      dev.off()
+}
+```
+
+#making heatmap
+```{r}
+#set heatmap params----
+#set seed for kmeans
+set.seed(123)
+
+#set fast clustering
+ht_opt$fast_hclust = TRUE
+ht_opt$message = FALSE
+
+
+#format df for complex heatmap
+df = BMDC_T_DE_merge %>%
+     column_to_rownames("gene") %>%
+     as.matrix()
+
+#prepare annotations
+top_annot = data.frame(Sample = colnames(df)) %>%
+            separate(Sample, into = c("Treatment", "Drug", "Concentration",
+                                    "Empty", "Cell_type","Time"), 
+                     sep ="_", remove =F) %>%
+            inner_join(metadata %>% 
+                      select(c(Sample, Drug_short, Concentration)) %>%
+                      unique(),
+                      by = c("Sample", "Concentration")) %>%
+            select(c(Sample, Cell_type, Time, Drug_short, Concentration)) %>%
+            mutate(Concentration = ifelse(grepl("[+]DMSO", Drug_short), "Hi (+DMSO)", Concentration),
+                   Concentration = factor(Concentration, 
+                                          levels = c("None", "Lo", "Hi (+DMSO)", "Hi")),
+                   Drug_short = gsub("[+]DMSO", "", Drug_short),
+                   Drug_short = factor(Drug_short,
+                                levels = c(
+                                "DMSO",
+                                "D-AP5",
+                                "AAA" ,
+                                "Erastin" ,
+                                "Cerestat" , 
+                                "D-AP5+Cerestat", "AAA+Erastin",
+                                "AAA+D-AP5","Erastin+D-AP5",
+                                "AAA+Cerestat", "Erastin+Cerestat")),
+                   Time = factor(Time, levels = c("4h", "24h", "72h"))) %>%
+            arrange(Cell_type, Time, Drug_short, Concentration) %>%
+            rename("Drug" = "Drug_short") %>%
+            column_to_rownames("Sample") %>%
+            filter(!(Concentration %in% c("Lo", "Hi (+DMSO)"))) %>%
+            mutate(CellType_Time = str_c(Cell_type, "_", Time),
+                   CellType_Time = factor(CellType_Time, levels = unique(CellType_Time))) %>%
+            select(CellType_Time, Drug)
+
+df2 = df[,rownames(top_annot)]
+
+#zero out non sig
+binary_filt = log2FC.all.binary[rownames(df2),colnames(df2)]
+df2_zeroed = df2 * abs(binary_filt) 
+df2_zeroed_filt = df2_zeroed %>%
+                  mutate_all(~ifelse(abs(.) <1 , 0, .)) %>%
+                  filter(rowSums(.!=0) !=  0)  %>%
+                  as.matrix()
+  
+p<-Heatmap(df2_zeroed_filt,
+        column_title = "Glu Drug DC-T RNA-seq",
+        name = "LFC \n(Drug/NO Drug)",
+        show_row_names = F,
+        row_title_gp = gpar(fontsize = 6),
+        show_column_names=F,
+        cluster_rows =T,
+        cluster_columns = F,
+        top_annotation = HeatmapAnnotation(df = top_annot,
+                         col = list(
+                                CellType_Time = c("Tcell_4h" = "#FBE0E0",
+                                        "Tcell_24h" = "#F08686",
+                                         "Tcell_72h" = "#ED6868", 
+                                        "BMDC_4h" = "#F2EEF5",
+                                        "BMDC_24h" = "#C0ACD0",
+                                        "BMDC_72h" =  "#9989A6"),
+                                Drug = c(
+                                "DMSO" = "grey",
+                                "AAA" = "#A6DFF7",
+                                "Erastin" = "#B9CEE6",
+                                "Cerestat" = "#8C9FCA", 
+                                "D-AP5" = "#6D91CB",
+                                "AAA+Cerestat" = "#5BABA4","AAA+D-AP5" = "#68C3A5",
+                                "Erastin+Cerestat" ="#539C84",
+                                "Erastin+D-AP5" ="#3E7563",
+                                "AAA+Erastin" ="#9E7FB8", "D-AP5+Cerestat" = "#5E4C6E")),
+                          border = T,
+                          show_legend = F,
+                          annotation_name_gp = gpar(fontsize = 8)),
+        column_split = top_annot$CellType_Time,
+        column_gap = unit(c(0,0,3,0,0), "mm"),
+        border = T,
+        row_km = 50,
+        col = colorRamp2(c(-4, -1,0,1,4), c("blue","white", "white","white", "red"))
+        )
+
+```
+
+```{r}
+#save clusters, re-order
+#get clusters----
+p_drawn <- draw(p) #draw to lock in row clustering
+#save plot
+do_plot( "complex_heatmap.pdf", 8, 15, p_drawn)
+p_drawn #run to show on screen and visually choose clusters
+
+#use LFC to determine order instead of transcript distribution
+rd <- row_order(p_drawn) #get row order & save
+
+#clusters
+#1: BMDC up 4h - 30
+#2: BMDC up 24h; shared - 29
+#3: BMDC up 24h; Erastin + AAA - 35
+#4: BMDC up 72h; shared - 41
+#5: BMDC up 72h; partial share - 47
+#6: BMDC up 72h; AAA driven - 40
+#7: BMDC up 72h; Erastin  + Cerestat - 38
+#8: BMDC up 72h; cerestat driven - 39
+#9: BMDC + T up 72h; shared; 50,48
+#10: T up 24h; shared - 49
+#11: Tup 24h; Erastin+Cerestat -36
+#12: T up 72h; shared - 46
+#13: T up 72h; AAA+Erastin - 45
+#14: T up 72h; Erastin driven - 44
+#15; T up 72h; erastin + ceresat - 42 
+#16; Tup 72h; Erastin + NMDA inhibitor - 43
+#17; BMDC down 4h; 31,32,34
+#18: BMDC down 24h; 33,17
+#19; BMDC down 72h; partially shared  - 13,14,15
+#20: BMDC down 72h; shared - 3,4
+#21: BMDC down 72h; erastin +cerestat only - 7,8
+#22: BMDC + T down; 2,5, 6
+#23: T 4h down; 1, 12
+#24: T 24h down; 16
+#25: T 72h down; shared - 9,10, 18, 20,
+#26: T 72h down; erastin driven in pair- 22,23
+#27: T 72h down; erastin + cerestat; 24,25,26
+#28: T 72h down; D-AP5 specific - 27
+#29: T 72h down; erastin only -21
+#30: T 72h down; Erastin + AAA - 19
+#31: T 72h down; Erastin + D-AP5 - 11
+#32: T 72h down; AAA + cerestat - 28
+#33: unassigned - 37
+
+#reorder to make sure order is 1:20 so we dont have issues when assigning clusters
+rd_ordered <- rd[order(as.numeric(names(rd)))] # make sure order is 1:20
+
+#get cluster gene lists
+cluster_list = list() #initialize empty list
+for(i in 1:50){
+  cluster_list[[i]] = data.frame(Cluster = i, 
+                                 gene = c(rownames(df2_zeroed_filt)[rd_ordered[[i]]]))
+}
+cluster_df = do.call(bind_rows, cluster_list)
+
+#edit/condense clusters by eye
+cluster_df_edit = cluster_df %>%
+                  mutate(old_cluster = Cluster, 
+                  Cluster = ifelse(old_cluster %in% c(30),1,
+                            ifelse(old_cluster %in% c(50,48, 49, 29, 35), 2,
+                            ifelse(old_cluster %in% c(41, 47, 39, 40), 3,
+                            ifelse(old_cluster %in% c(38), 4, 
+                            ifelse(old_cluster %in% c(36,44,46,45), 5,
+                            ifelse(old_cluster %in% c(42), 6, 
+                            ifelse(old_cluster %in% c(43), 7 , 
+                            ifelse(old_cluster %in% c(3,4,13,14,15,2,5,6), 8, 
+                              
+                             ifelse(old_cluster %in% c(31,32,34), 9,
+                             ifelse(old_cluster %in% c(33,17), 10,
+                             ifelse(old_cluster %in% c(7,8), 11, 
+                             ifelse(old_cluster %in% c(1,12), 12, 
+                             ifelse(old_cluster %in% c(16), 13, 
+                             ifelse(old_cluster %in% c(9,10,18,20,22,23, 27), 14, 
+                             ifelse(old_cluster %in% c(21), 16, 
+                             ifelse(old_cluster %in% c(19), 17, 
+                             ifelse(old_cluster %in% c(28), 18, 
+                             ifelse(old_cluster %in% c(11), 19,
+                             ifelse(old_cluster %in% c(24,25,26), 20, 
+                             
+                             ifelse(old_cluster %in% c(37), 33, 
+                                    34
+                                    )))))))))))))))))))
+                            )) %>%
+                  arrange(Cluster)
+
+rownames(cluster_df_edit) = cluster_df_edit$gene
+
+write.csv(as.matrix(cluster_df_edit), 
+         path(output_dir,"20241005_50_cluster_list_FDR0.05_LFC1.csv"))
+
+#re-order H_LFC and re-draw heatmap (please make a function for this soon kate!!!!)----
+df_reorder = df2_zeroed_filt[cluster_df_edit$gene,]
+left_annot = cluster_df_edit %>% select(Cluster)
+
+
+u <- df_reorder[cluster_df_edit %>% 
+                filter(Cluster == "33") %>% 
+                select(gene) %>% unlist(),]
+
+p<-Heatmap(df_reorder,
+        column_title = "Glu Drug DC-T RNA-seq",
+        name = "LFC \n(Drug/NO Drug)",
+        show_row_names = F,
+        row_title_gp = gpar(fontsize = 12),
+        row_names_gp = gpar(fontsize = 4),
+        show_column_names=F,
+        cluster_rows =F,
+        cluster_columns = F,
+        top_annotation = HeatmapAnnotation(df = top_annot,
+                         col = list(
+                                CellType_Time = c("Tcell_4h" = "#FBE0E0",
+                                        "Tcell_24h" = "#F08686",
+                                         "Tcell_72h" = "#ED6868", 
+                                        "BMDC_4h" = "#F2EEF5",
+                                        "BMDC_24h" = "#C0ACD0",
+                                        "BMDC_72h" =  "#9989A6"),
+                                Drug = c(
+                                "DMSO" = "grey",
+                                "AAA" = "#A6DFF7",
+                                "Erastin" = "#B9CEE6",
+                                "Cerestat" = "#8C9FCA", 
+                                "D-AP5" = "#6D91CB",
+                                "AAA+Cerestat" = "#5BABA4","AAA+D-AP5" = "#68C3A5",
+                                "Erastin+Cerestat" ="#539C84",
+                                "Erastin+D-AP5" ="#3E7563",
+                                "AAA+Erastin" ="#9E7FB8",
+                                "D-AP5+Cerestat" = "#5E4C6E")),
+                          border = T,
+                          show_legend = F,
+                          annotation_name_gp = gpar(fontsize = 12)),
+        column_split = top_annot$CellType_Time,
+        column_gap = unit(c(0,0,3,0,0), "mm"),
+        #row_km =10,
+        row_split = left_annot$Cluster,
+        row_gap = unit(0.5, "mm"),
+        border = T,
+        col = colorRamp2(c(-3, -1,0,1,3),
+                         c("blue","white", "white","white", "red"))
+        )
+
+p_drawn <- draw(p)
+#save plot
+do_plot( "complex_heatmap2.pdf", 8, 15, p_drawn)
+
+
+rd <-row_order(p_drawn)
+rd_ordered <- rd[order(as.numeric(names(rd)))]
+
+cluster_list2 = list()
+for(i in 1:10){
+  cluster_list2[[i]] = data.frame(Cluster_u = i, 
+                                 gene = c(rownames(u)[rd_ordered[[i]]]))
+}
+cluster_df2 = do.call(bind_rows, cluster_list2)
+write.csv(as.matrix(cluster_df2), path(output_dir, "unassigned_1.csv"))
+
+p_drawn
+cdf2_edit <- cluster_df2 %>%
+             mutate(New_Cluster = ifelse(Cluster_u == 1, 9,
+                                  ifelse(Cluster_u == 2, 14,
+                                  ifelse(Cluster_u == 10, 5,
+                                  ifelse(Cluster_u == 9, 1,
+                                  ifelse(Cluster_u == 5, 3,
+                                  ifelse(Cluster_u == 8, 2,
+                                  ifelse(Cluster_u == 3, 8,
+                                  ifelse(Cluster_u == 4, 5,
+                                                   33)))))))))
+  
+```
+
+#iteration 2
+```{r}
+c4 = cluster_df_edit %>%
+     full_join(cdf2_edit, by = "gene") %>%
+     mutate(Cluster = ifelse(Cluster ==33, New_Cluster, Cluster))
+
+#re-order H_LFC and re-draw heatmap (please make a function for this soon kate!!!!)----
+df_reorder = df2_zeroed_filt[c4$gene,]
+left_annot = c4 %>% select(Cluster)
+
+
+u <- df_reorder[c4 %>% 
+                filter(Cluster == "33") %>% 
+                select(gene) %>% unlist(),]
+
+p<-Heatmap(u,
+        column_title = "Glu Drug DC-T RNA-seq",
+        name = "LFC \n(Drug/NO Drug)",
+        show_row_names = F,
+        row_title_gp = gpar(fontsize = 12),
+        row_names_gp = gpar(fontsize = 4),
+        show_column_names=F,
+        cluster_rows =T,
+        cluster_columns = F,
+        top_annotation = HeatmapAnnotation(df = top_annot,
+                         col = list(
+                                CellType_Time = c("Tcell_4h" = "#FBE0E0",
+                                        "Tcell_24h" = "#F08686",
+                                         "Tcell_72h" = "#ED6868", 
+                                        "BMDC_4h" = "#F2EEF5",
+                                        "BMDC_24h" = "#C0ACD0",
+                                        "BMDC_72h" =  "#9989A6"),
+                                Drug = c(
+                                "DMSO" = "grey",
+                                "AAA" = "#A6DFF7",
+                                "Erastin" = "#B9CEE6",
+                                "Cerestat" = "#8C9FCA", 
+                                "D-AP5" = "#6D91CB",
+                                "AAA+Cerestat" = "#5BABA4","AAA+D-AP5" = "#68C3A5",
+                                "Erastin+Cerestat" ="#539C84",
+                                "Erastin+D-AP5" ="#3E7563",
+                                "AAA+Erastin" ="#9E7FB8",
+                                "D-AP5+Cerestat" = "#5E4C6E")),
+                          border = T,
+                          show_legend = F,
+                          annotation_name_gp = gpar(fontsize = 12)),
+        column_split = top_annot$CellType_Time,
+        column_gap = unit(c(0,0,3,0,0), "mm"),
+        row_km =10,
+        #row_split = left_annot$Cluster,
+        row_gap = unit(0.5, "mm"),
+        border = T,
+        col = colorRamp2(c(-3, 0,3),
+                         c("blue","white", "red"))
+        )
+
+p_drawn <- draw(p)
+p_drawn
+#save plot
+do_plot( "unassigned_3.pdf", 8, 15, p_drawn)
+
+rd <-row_order(p_drawn)
+rd_ordered <- rd[order(as.numeric(names(rd)))]
+
+cluster_list3 = list()
+for(i in 1:10){
+  cluster_list3[[i]] = data.frame(Cluster_u3 = i, 
+                                 gene = c(rownames(u)[rd_ordered[[i]]]))
+}
+cluster_df3 = do.call(bind_rows, cluster_list3)
+write.csv(as.matrix(cluster_df3), path(output_dir, "unassigned_3.csv"))
+
+cdf3_edit <- cluster_df3 %>%
+             mutate(New_Cluster2 = ifelse(Cluster_u3 %in% c(1,2), 8,
+                                  ifelse(Cluster_u3 == 8, 2,
+                                  ifelse(Cluster_u3 == 10, 5,
+                                  ifelse(Cluster_u3 == 3, 18,
+                                  ifelse(Cluster_u3 == 9, 1,
+                                  ifelse(Cluster_u3 == 6, 21,
+                                  ifelse(Cluster_u3 == 5, 21,
+                                  ifelse(Cluster_u3 == 7, 1,
+                                                   33)))))))))
+```
+
+#iteration 3
+```{r}
+c5 = c4 %>%
+     full_join(cdf3_edit, by = "gene") %>%
+     mutate(Cluster = ifelse(Cluster ==33, New_Cluster2, Cluster))
+
+#re-order H_LFC and re-draw heatmap (please make a function for this soon kate!!!!)----
+df_reorder = df2_zeroed_filt[c5$gene,]
+left_annot = c5 %>% select(Cluster)
+
+
+u <- df_reorder[c5 %>% 
+                filter(Cluster == "33") %>% 
+                select(gene) %>% unlist(),]
+
+p<-Heatmap(df_reorder,
+        column_title = "Glu Drug DC-T RNA-seq",
+        name = "LFC \n(Drug/NO Drug)",
+        show_row_names = F,
+        row_title_gp = gpar(fontsize = 12),
+        row_names_gp = gpar(fontsize = 4),
+        show_column_names=F,
+        cluster_rows =F,
+        cluster_columns = F,
+        top_annotation = HeatmapAnnotation(df = top_annot,
+                         col = list(
+                                CellType_Time = c("Tcell_4h" = "#FBE0E0",
+                                        "Tcell_24h" = "#F08686",
+                                         "Tcell_72h" = "#ED6868", 
+                                        "BMDC_4h" = "#F2EEF5",
+                                        "BMDC_24h" = "#C0ACD0",
+                                        "BMDC_72h" =  "#9989A6"),
+                                Drug = c(
+                                "DMSO" = "grey",
+                                "AAA" = "#A6DFF7",
+                                "Erastin" = "#B9CEE6",
+                                "Cerestat" = "#8C9FCA", 
+                                "D-AP5" = "#6D91CB",
+                                "AAA+Cerestat" = "#5BABA4","AAA+D-AP5" = "#68C3A5",
+                                "Erastin+Cerestat" ="#539C84",
+                                "Erastin+D-AP5" ="#3E7563",
+                                "AAA+Erastin" ="#9E7FB8",
+                                "D-AP5+Cerestat" = "#5E4C6E")),
+                          border = T,
+                          show_legend = F,
+                          annotation_name_gp = gpar(fontsize = 12)),
+        column_split = top_annot$CellType_Time,
+        column_gap = unit(c(0,0,3,0,0), "mm"),
+        #row_km =10,
+        row_split = left_annot$Cluster,
+        row_gap = unit(0.5, "mm"),
+        border = T,
+        col = colorRamp2(c(-3, 0,3),
+                         c("blue","white", "red"))
+        )
+
+p_drawn <- draw(p)
+p_drawn
+#save plot
+do_plot( "complex_heatmp2.pdf", 8, 15, p_drawn)
+
+rd = row_order(p_drawn)
+rd_ordered <- rd[order(as.numeric(names(rd)))]
+
+cluster_list4 = list()
+for(i in 1:10){
+  cluster_list4[[i]] = data.frame(Cluster_u4 = i, 
+                                 gene = c(rownames(u)[rd_ordered[[i]]]))
+}
+cluster_df4 = do.call(bind_rows, cluster_list4)
+write.csv(as.matrix(cluster_df4), path(output_dir, "unassigned_4.csv"))
+
+cdf4_edit <- cluster_df4 %>%
+             mutate(New_Cluster4 = ifelse(Cluster_u4 %in% c(10,9), 7,
+                                  ifelse(Cluster_u4 %in% c(3,5), 10,
+                                  ifelse(Cluster_u4 == 4, 8,
+                                  ifelse(Cluster_u4 == 6, 33,
+                                  ifelse(Cluster_u4 == 8, 5,
+                                  ifelse(Cluster_u4 %in% c(1,2), 12,
+                                                   33)))))))
+```
+
+#another one
+```{r}
+c6 = c5 %>%
+     full_join(cdf4_edit, by = "gene") %>%
+     mutate(Cluster = ifelse(Cluster ==33, New_Cluster4, Cluster))
+
+#re-order H_LFC and re-draw heatmap (please make a function for this soon kate!!!!)----
+df_reorder = df2_zeroed_filt[c6$gene,]
+left_annot = c6 %>% select(Cluster)
+
+
+u <- df_reorder[c6 %>% 
+                filter(Cluster == "33") %>% 
+                select(gene) %>% unlist(),]
+
+p<-Heatmap(u,
+        column_title = "Glu Drug DC-T RNA-seq",
+        name = "LFC \n(Drug/NO Drug)",
+        show_row_names = F,
+        row_title_gp = gpar(fontsize = 12),
+        row_names_gp = gpar(fontsize = 4),
+        show_column_names=F,
+        cluster_rows =T,
+        cluster_columns = F,
+        top_annotation = HeatmapAnnotation(df = top_annot,
+                         col = list(
+                                CellType_Time = c("Tcell_4h" = "#FBE0E0",
+                                        "Tcell_24h" = "#F08686",
+                                         "Tcell_72h" = "#ED6868", 
+                                        "BMDC_4h" = "#F2EEF5",
+                                        "BMDC_24h" = "#C0ACD0",
+                                        "BMDC_72h" =  "#9989A6"),
+                                Drug = c(
+                                "DMSO" = "grey",
+                                "AAA" = "#A6DFF7",
+                                "Erastin" = "#B9CEE6",
+                                "Cerestat" = "#8C9FCA", 
+                                "D-AP5" = "#6D91CB",
+                                "AAA+Cerestat" = "#5BABA4","AAA+D-AP5" = "#68C3A5",
+                                "Erastin+Cerestat" ="#539C84",
+                                "Erastin+D-AP5" ="#3E7563",
+                                "AAA+Erastin" ="#9E7FB8",
+                                "D-AP5+Cerestat" = "#5E4C6E")),
+                          border = T,
+                          show_legend = F,
+                          annotation_name_gp = gpar(fontsize = 12)),
+        column_split = top_annot$CellType_Time,
+        column_gap = unit(c(0,0,3,0,0), "mm"),
+        row_km =10,
+        #row_split = left_annot$Cluster,
+        row_gap = unit(0.5, "mm"),
+        border = T,
+        col = colorRamp2(c(-3, 0,3),
+                         c("blue","white", "red"))
+        )
+
+p_drawn <- draw(p)
+p_drawn
+#save plot
+do_plot( "unassigned_5.pdf", 8, 15, p_drawn)
+
+rd = row_order(p_drawn)
+rd_ordered <- rd[order(as.numeric(names(rd)))]
+
+cluster_list5 = list()
+for(i in 1:10){
+  cluster_list5[[i]] = data.frame(Cluster_u5 = i, 
+                                 gene = c(rownames(u)[rd_ordered[[i]]]))
+}
+cluster_df5 = do.call(bind_rows, cluster_list5)
+write.csv(as.matrix(cluster_df5), path(output_dir, "unassigned_5.csv"))
+
+cdf5_edit <- cluster_df5 %>%
+             mutate(New_Cluster5 = ifelse(Cluster_u5 %in% c(7,9), 1,
+                                  ifelse(Cluster_u5 %in% c(8), 3,
+                                  ifelse(Cluster_u5 == 4, 8,
+                                  ifelse(Cluster_u5 == 6, 5,
+                                  ifelse(Cluster_u5 == 1, 9,
+                                  ifelse(Cluster_u5 == 10, 5,
+                                  ifelse(Cluster_u5 %in% c(2,3), 10,
+                                                   33))))))))
+```
+
+#still at it...
+```{r}
+c7 = c6 %>%
+     full_join(cdf5_edit, by = "gene") %>%
+     mutate(Cluster = ifelse(Cluster ==33, New_Cluster5, Cluster))
+
+#re-order H_LFC and re-draw heatmap (please make a function for this soon kate!!!!)----
+df_reorder = df2_zeroed_filt[c7$gene,]
+left_annot = c7 %>% select(Cluster)
+
+
+u <- df_reorder[c7 %>% 
+                filter(Cluster == "33") %>% 
+                select(gene) %>% unlist(),]
+
+p<-Heatmap(u,
+        column_title = "Glu Drug DC-T RNA-seq",
+        name = "LFC \n(Drug/NO Drug)",
+        show_row_names = T,
+        row_title_gp = gpar(fontsize = 12),
+        row_names_gp = gpar(fontsize = 4),
+        show_column_names=F,
+        cluster_rows =T,
+        cluster_columns = F,
+        top_annotation = HeatmapAnnotation(df = top_annot,
+                         col = list(
+                                CellType_Time = c("Tcell_4h" = "#FBE0E0",
+                                        "Tcell_24h" = "#F08686",
+                                         "Tcell_72h" = "#ED6868", 
+                                        "BMDC_4h" = "#F2EEF5",
+                                        "BMDC_24h" = "#C0ACD0",
+                                        "BMDC_72h" =  "#9989A6"),
+                                Drug = c(
+                                "DMSO" = "grey",
+                                "AAA" = "#A6DFF7",
+                                "Erastin" = "#B9CEE6",
+                                "Cerestat" = "#8C9FCA", 
+                                "D-AP5" = "#6D91CB",
+                                "AAA+Cerestat" = "#5BABA4","AAA+D-AP5" = "#68C3A5",
+                                "Erastin+Cerestat" ="#539C84",
+                                "Erastin+D-AP5" ="#3E7563",
+                                "AAA+Erastin" ="#9E7FB8",
+                                "D-AP5+Cerestat" = "#5E4C6E")),
+                          border = T,
+                          show_legend = F,
+                          annotation_name_gp = gpar(fontsize = 12)),
+        column_split = top_annot$CellType_Time,
+        column_gap = unit(c(0,0,3,0,0), "mm"),
+        row_km =15,
+        #row_split = left_annot$Cluster,
+        row_gap = unit(0.5, "mm"),
+        border = T,
+        col = colorRamp2(c(-3, 0,3),
+                         c("blue","white", "red"))
+        )
+
+p_drawn <- draw(p)
+p_drawn
+#save plot
+do_plot( "unassigned_6.pdf", 8, 15, p_drawn)
+
+rd = row_order(p_drawn)
+rd_ordered <- rd[order(as.numeric(names(rd)))]
+
+cluster_list6 = list()
+for(i in 1:15){
+  cluster_list6[[i]] = data.frame(Cluster_u6 = i, 
+                                 gene = c(rownames(u)[rd_ordered[[i]]]))
+}
+cluster_df6 = do.call(bind_rows, cluster_list6)
+write.csv(as.matrix(cluster_df6), path(output_dir, "unassigned_6.csv"))
+
+cdf6_edit <- cluster_df6 %>%
+             mutate(New_Cluster6 = ifelse(Cluster_u6 %in% c(11,15,6) , 1,
+                                  ifelse(Cluster_u6 %in% c(1), 10,
+                                  ifelse(Cluster_u6 %in% c(12,13,14) |
+                                      gene %in% c("Fastk", "Frat2",
+                                                  "Gclm", "Ghitm", "Rtn4",
+                                                  "P4hb", "Hsbp1", "Sdhb") , 5,
+                                  ifelse(gene %in% c("Gm48909", "Gm9844",
+                                                     "Rbm3", "Nampt", "Nsa2"), 2,
+                                  ifelse(Cluster_u6 %in% c(10,7), 3,
+                                  ifelse(Cluster_u6 == 5, 7,
+                                  ifelse(gene %in% c("Galns", "Tmem38b",
+                                                     "Mir703","Golt1b"), 3,
+                                  ifelse(gene %in% c("Taldo1", "Sdhd",
+                                                     "Krr1", "Pgd"), 6,
+                                  ifelse(gene %in% c("Gm47283", "Slc7a11", "Kpna3",
+                                                     "Gm21887", "Ikbke", "Rapgef2",
+                                                     "Uba6"), 9,
+                                  ifelse(gene %in% c("Fscn1",  "Cd83", "Cpne1"), 12, 
+                                  ifelse(gene %in% c("Creb5", "Abcc1", "Cd1d1",
+                                                     "Gls"), 11, 
+                                  ifelse(gene %in% c("Rnpep"), 10, 
+                                  ifelse(gene %in% c("Akap13"), 14,
+                                         33
+                                         ))))))))))))))
+```
+
+#and again...
+```{r}
+c8 = c7 %>%
+     full_join(cdf6_edit, by = "gene") %>%
+     mutate(Cluster = ifelse(Cluster ==33, New_Cluster6, Cluster))
+write.csv(as.matrix(c8), path(output_dir, "clusterlist_8.csv"))
+
+#re-order H_LFC and re-draw heatmap (please make a function for this soon kate!!!!)----
+df_reorder = df2_zeroed_filt[c8$gene,]
+cluster_info = c8 %>% 
+             mutate(Cluster = ifelse(Cluster >= 2, Cluster + 1,
+                                     Cluster),
+                    Cluster = ifelse(Cluster == 22, 2, Cluster),
+                    Cluster = ifelse(Cluster == 9, 33, Cluster),
+                    Cluster = ifelse(Cluster %in% c(10,11,12), Cluster -1, Cluster),
+                    Cluster = ifelse(Cluster == 33, 12, Cluster),
+                    Cluster = ifelse(Cluster > 16, Cluster  -1, Cluster)) #%>%
+
+left_annot = cluster_info %>% dplyr::select(Cluster)
+
+write.csv(as.matrix(left_annot), fs::path(output_dir, "clusterlist_8_reorder.csv"))
+
+u <- df_reorder[c8 %>% 
+                filter(Cluster == "33") %>% 
+                select(gene) %>% unlist(),]
+
+p<-Heatmap(df_reorder,
+        column_title = "Glu Drug DC-T RNA-seq",
+        name = "LFC \n(Drug/NO Drug)",
+        show_row_names = F,
+        row_title_gp = gpar(fontsize = 10),
+        row_names_gp = gpar(fontsize = 4),
+        show_column_names=F,
+        cluster_rows =F,
+        cluster_columns = F,
+        top_annotation = HeatmapAnnotation(df = top_annot,
+                         col = list(
+                                CellType_Time = c("Tcell_4h" = "#FBE0E0",
+                                        "Tcell_24h" = "#F08686",
+                                         "Tcell_72h" = "#ED6868", 
+                                        "BMDC_4h" = "#F2EEF5",
+                                        "BMDC_24h" = "#C0ACD0",
+                                        "BMDC_72h" =  "#9989A6"),
+                                Drug = c(
+                                "DMSO" = "grey",
+                                "AAA" = "#A6DFF7",
+                                "Erastin" = "#B9CEE6",
+                                "Cerestat" = "#8C9FCA", 
+                                "D-AP5" = "#6D91CB",
+                                "AAA+Cerestat" = "#5BABA4","AAA+D-AP5" = "#68C3A5",
+                                "Erastin+Cerestat" ="#539C84",
+                                "Erastin+D-AP5" ="#3E7563",
+                                "AAA+Erastin" ="#9E7FB8",
+                                "D-AP5+Cerestat" = "#5E4C6E")),
+                          border = T,
+                          show_legend = T,
+                          annotation_name_gp = gpar(fontsize = 12)),
+        column_split = top_annot$CellType_Time,
+        column_gap = unit(c(0,0,3,0,0), "mm"),
+        #row_km =5,
+        row_split = left_annot$Cluster,
+        row_gap = unit(0.5, "mm"),
+        border = T,
+        col = colorRamp2(c(-3, 0,3),
+                         c("blue","white", "red"))
+        )
+
+p_drawn <- draw(p)
+p_drawn
+#save plot
+do_plot( "heatmap6_legend.pdf", 8, 10, p_drawn)
+
+
+```
+
+
+#gene enrichment on clusters
+```{r}
+for(i in 16:20){
+
+  gene_list = df_reorder %>%
+  data.frame() %>%
+  rownames_to_column(var = "gene") %>%
+  filter(gene %in% (cluster_info %>% 
+                   dplyr::filter(Cluster == i) %>%
+                   dplyr::select(gene) %>% unlist())) 
+
+GO <-enrichGO(  gene = gene_list$gene,
+                OrgDb         = org.Mm.eg.db,
+                keyType       = 'SYMBOL',
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.1,
+                qvalueCutoff = 0.1)
+
+p <- dotplot(GO) + 
+     ggtitle(str_c("Cluster", as.character(i))) +
+     theme(axis.text.y = element_text(size = 10),
+           plot.title = element_text(hjust=0.5)) 
+#save plots
+save_plot(fs::path(output_dir, 
+                   str_c("clusterprofiler/ErichGO_Cluster_", as.character(i), ".pdf")),p, base_aspect_ratio =1.6)
+}
+
+```
+#other go plots
+```{r}
+groupGO <-groupGO(gene = gene_list$gene,
+        OrgDb = org.Mm.eg.db,
+        ont = "BP",
+        keyType = 'SYMBOL') 
+
+groupGO.df = summary(groupGO) %>%
+             arrange(Count) %>%
+             filter(Count > .1 * length(gene_list$gene) ) %>%
+             mutate(Description= factor(Description,
+                          levels = unique(Description))) %>%
+             filter(!grepl("interspecies", Description)) 
+
+p1<-ggplot(groupGO.df, aes(y = Description, x = Count)) +
+  geom_col() +
+  geom_text(mapping = aes(x = Count + 4, label = GeneRatio), size = 2) 
+
+groupGO <-groupGO(gene = gene_list$gene,
+        OrgDb = org.Mm.eg.db,
+        ont = "MF",
+        keyType = 'SYMBOL') 
+
+groupGO.df = summary(groupGO) %>%
+             arrange(Count) %>%
+             filter(Count > .1 * length(gene_list$gene) ) %>%
+             mutate(Description= factor(Description,
+                          levels = unique(Description))) %>%
+             filter(!grepl("interspecies", Description)) 
+
+p2<-ggplot(groupGO.df, aes(y = Description, x = Count)) +
+  geom_col() +
+  geom_text(mapping = aes(x = Count + 4, label = GeneRatio), size = 2)
+
+```
+
+
