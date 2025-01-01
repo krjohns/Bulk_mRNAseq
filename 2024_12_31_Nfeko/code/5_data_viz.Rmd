@@ -1,11 +1,11 @@
-### Title: 20230925 Intercellular DCT RNA-seq with Glutamate Inhibitors
+### Title: NfeKO RNAseq
 ### Author: Kate Johnson
-### Date: 09/30/2024
+### Date: 12/31/2024
 ### Add'tl Notes:
 
 # setup
 libraries
-```{r}
+```{r, warning=FALSE}
 # all-purpose data analysis tools
 library(tidyverse)
 # ggplot extension
@@ -75,9 +75,9 @@ directories
 ```{r}
 wd = getwd()
 # For reading in counts/metadata
-input_dir = path(wd, "../input/data/2_formatted_data")
+input_dir = fs::path(wd, "../input/data/2_formatted_data")
 # For saving plots  
-output_dir = path(wd, "../output")
+output_dir = fs::path(wd, "../output")
 
 ```
 
@@ -90,65 +90,52 @@ sources
 # Read in Data
 ```{r, warnings =F}
 #counts
-counts = read_csv(path(input_dir, "20240925_GluDrug_DCT_counts.csv")) 
+counts = read_csv(fs::path(input_dir, "20241231_Nfekoseq_counts.csv")) 
 #rename gene column
 colnames(counts)[1] = "gene"
+
 # format matrix to be ready for de analysis
 genes <- counts$gene
 counts$gene <- NULL
-rownames(counts) <- genes
+rownames(counts) <- make.unique(genes) #deal with duplicate gene names
+                    #mostly this should be resolved after filtering
 
-#meta        
-metadata = read_csv(path(input_dir, "20240925_GluDrug_DCT_metadata.csv")) %>%
+#meta data
+metadata = read_csv(fs::path(input_dir, "20241231_Nfekoseq__metadata.csv")) %>%
            #drop unused first col
-           select(-1) %>%
+           dplyr::select(-1) %>%
            #refactor relevant columns
-           mutate(Sample = gsub("[+]", ".", str_c(Treatment, "_" , Drug_abbrev_conc,
-                                                  "__", Cell_type, "_", Time)),
-                  Sample_Rep = gsub("[+]", ".", str_c(Sample, ".", Replicate)),
-                  Time = factor(Time, levels = c("4h", "24h", "72h")),
-                  Drug_type = factor(Drug_type, levels = c("None", "Single", "Pair")),
-                  Concentration = ifelse(is.na(Concentration), "None", Concentration),
-                  Concentration = factor(Concentration, levels = c("None","Lo", "Hi")),
-                  Target_type = factor(Target_type, levels = c("None", "Transport Inhibitor", 
-                                  "Receptor Inhibitor", "Transport Inhibitor (multi-drug)",
-                                  "Receptor Inhibitor (multi-drug)",
-                                  "Transport + Receptor Inhibitor")),
-                  Drug = factor(Drug, levels = unique(Drug)),
-                  Sample = factor(Sample, levels = unique(Sample)),
-                  Replicate = as.character(Replicate)) %>%
-           #filter out wells with known missing samples
-           filter(!(Cell_type == "BMDC" & Time == "24h" & 
-                      Well %in% c("C_P2_04", "D_P2_04", "E_P2_04")))
+           mutate(Target = factor(Target, levels = c("sgCtrl", "sgNfe2l1","sgNfe2l2", "doubleKO"))) %>%
+           filter(Sample_Name != "sgCtrl_g1_rep1")
 
 #remove plus signs from colnames to avoid subsequent issues
-colnames(counts) = gsub("_Tcell","__Tcell",gsub("_BMDC","__BMDC",gsub("[+]", ".", colnames(counts))))
-counts_filt = counts[,metadata$Sample_Rep]
-rownames(counts_filt) <- genes
+counts_filt = counts[,metadata$Sample_Name]
+rownames(counts_filt) <- make.unique(genes)
  
 ```
 # QC
 Data Normalization
 ```{r}
 #set cpm thresholds (keep low to start)
-cpm_threshold = 15
+cpm_threshold = 10
 cpm_needed = 2
 
-groups <- factor(metadata$Sample)
+groups <- factor(metadata$Target)
 dge = DGEList(counts = counts_filt, group = groups)
 dge_norm = calcNormFactors(dge)
-#require cpm>15 in at least 2 samples within BMDC samples or 2 within Tcell samples (stricter)
-isexpr = (rowSums(cpm(dge_norm[,grepl("BMDC",colnames(dge_norm))]) > cpm_threshold) >= cpm_needed) | (rowSums(cpm(dge_norm[,grepl("Tcell",colnames(dge_norm))]) > cpm_threshold) >= cpm_needed)
+#require cpm>10 in at least 2 samples 
+isexpr = (rowSums(cpm(dge_norm) > cpm_threshold) >= cpm_needed)
   
 dge_norm_fltd = dge_norm[isexpr, ]
 
-cpm = cpm(dge_norm_fltd) #dropped to ~20k for cpms10, ~15k for cpms15 (all samples),
-                          #~15776 for strictest
-cpm_all = cpm(dge_norm)
+cpm = cpm(dge_norm_fltd) #dropped to ~8.7k for cpms10
+cpm_all = cpm(dge_norm) #~32k reads total
 
 #save cpm heatmaps for plotting in morpheus
-#write.csv(as.matrix(cpm), path(output_dir, "cpm_tables/cpms15/DC2orT2/20240925_cpmTable_filt.csv"))
-#write.csv(as.matrix(cpm_all), path(output_dir, "cpm_tables/20240925_cpmTable_all.csv"))
+#write.csv(as.matrix(cpm), fs::path(output_dir, "cpm_tables/Filtered/20241231_Nfekoseq_cpmTable_filt_cpms10_2samples.csv"))
+#write.csv(as.matrix(cpm_all), fs::path(output_dir, "cpm_tables/Filtered/20241231_Nfekoseq_cpmTable_all.csv"))
+
+#consider tossing low read count samples (sgCtrl g1 rep1, sgNfe2l1 g1 rep2 etc) before proceeding with DE analysis
 
 ```
 
@@ -157,45 +144,20 @@ PCA
 # run pca
 pca = prcomp(t(cpm), center=T, scale=T)
 # combine pca results with metadata for easy plotting
-pca_res = bind_cols(metadata, as_tibble(pca$x)) %>%
-          mutate(Time = factor(Time, levels = c("4h", "24h", "72h"))) %>%
-          rename("time(h)" ="Time") %>%
-          mutate(Control = ifelse(Drug == "None", 
-                           str_c(Treatment, "_", `time(h)`), "other"), 
-                 .after = Sample,
-                 Control = factor(Control,
-                        levels = c("Control_4h", "Control_24h", "Control_72h",
-                                   "LSG_4h", "LSG_24h", "LSG_72h", "other")),
-                 Punctured = ifelse(Cell_type == "Tcell" &
-                                      `time(h)` == "4h" & 
-                                      Well %in% c("A_P1_01", "A_P1_02"),
-                                    "Punctured", "other"),
-                 AAA = ifelse(grepl("AAA", Drug),
-                              as.character(Drug), 
-                              "other"),
-                 Erastin = ifelse(grepl("Erastin", Drug),
-                              as.character(Drug), 
-                              "other"),
-                 Cerestat = ifelse(grepl("Cerestat", Drug),
-                              as.character(Drug), 
-                              "other"),
-                 `D-AP5` = ifelse(grepl("D-AP5", Drug),
-                              as.character(Drug), 
-                              "other"),
-                 Drug = factor(Drug, levels = unique(Drug)))
+pca_res = bind_cols(metadata, as_tibble(pca$x)) 
 
 # plot
 # color by treatment
-p1<-ggplot(pca_res, aes(PC1, PC2, fill=Treatment)) + 
+p1<-ggplot(pca_res, aes(PC1, PC2, fill=Target)) + 
     geom_point(size=3, shape =21, color = "black") +
-    scale_fill_manual(values = c("grey", "#F68064")) +
+    #scale_fill_manual(values = c("grey", "#F68064")) +
     theme(text = element_text(size=6),
           legend.position = "top")
 p1
 # color by timepoint
-p2<-ggplot(pca_res, aes(PC1, PC2, fill=`time(h)`)) + 
+p2<-ggplot(pca_res, aes(PC1, PC2, fill=Guide)) + 
     geom_point(size=3, shape = 21, color = "black") +
-    scale_fill_manual(values = c("grey95",  "grey55","grey20"))+
+    #scale_fill_manual(values = c("grey95",  "grey55","grey20"))+
     theme(text = element_text(size=6),
           legend.position = "top")
 p2
@@ -206,79 +168,19 @@ p3<-ggplot(pca_res, aes(PC1, PC2, fill=Replicate)) +
           legend.position = "top")
 p3
 
-p4<-ggplot(pca_res, aes(PC1, PC2, fill=Cell_type)) + 
+p4<-ggplot(pca_res, aes(PC1, PC2, fill=Sample_Name)) + 
     geom_point(size=3, shape =21, color = "black") +
-    scale_fill_manual(values = c( "#8C9FCA", "#68C3A5"))+
     theme(text = element_text(size=6),
           legend.position = "top")
 p4
 
-#Drug_type
-p5<-ggplot(pca_res, aes(PC1, PC2, fill=Drug_type)) + 
-    geom_point(size=3, shape =21, color = "black") +
-    scale_fill_manual(values = c("white" ,"#C0ACD0", "mediumorchid4"))+
-    theme(text = element_text(size=6),
-          legend.position = "top")
-p5
-
-#Target_type
-p6<-ggplot(pca_res, aes(PC1, PC2, fill=Target_type)) + 
-    geom_point(size=3, shape =21, color = "black") +
-    #scale_fill_manual(values = c("white" ,"#C0ACD0", "mediumorchid4"))+
-    theme(text = element_text(size=3),
-          legend.position = "top") +
-    guides(fill = guide_legend(nrow=3))
-
-p6
-
-p7<-ggplot(pca_res, aes(PC1, PC2, fill=Concentration)) + 
-    geom_point(size=3, shape =21, color = "black") +
-    #scale_fill_manual(values = c("white" ,"#C0ACD0", "mediumorchid4"))+
-    theme(text = element_text(size=6),
-          legend.position = "top") 
-p7
-
-p8<-ggplot(pca_res, aes(PC1, PC2, fill=DMSO)) + 
-    geom_point(size=3, shape =21, color = "black") +
-    #scale_fill_manual(values = c("white" ,"#C0ACD0", "mediumorchid4"))+
-    theme(text = element_text(size=6),
-          legend.position = "top") 
-p8
-
-p9<-ggplot(pca_res, aes(PC1, PC2, fill=Drug)) + 
-    geom_point(size=0.5, shape =21, color = "black") +
-    #scale_fill_manual(values = c("white" ,"#C0ACD0", "mediumorchid4"))+
-    theme(text = element_text(size=2),
-          legend.position = "top") +
-    guides(fill = guide_legend(nrow=5))
-p9
-
-p10<-ggplot(pca_res, aes(PC1, PC2, color= Control)) + 
-    geom_point(data = pca_res %>% filter(Control == "other"), size=1.2) +
-    geom_point(data = pca_res %>% filter(Control != "other"), size=1.2) +
-    scale_color_manual(values = c( "grey95", "#A6DFF7", "#AED29E", "#5BABA4",
-                                   "#F4908E", "#D278AE", "#9E7FB8"))+
-    theme(text = element_text(size=4),
-          legend.position = "top") +
-    guides(color = guide_legend(nrow=2))
-p10
-
-
-p11<-ggplot(pca_res, aes(PC1, PC2, color= Punctured)) + 
-    geom_point(data = pca_res %>% filter(Punctured == "other"), size=1.2) +
-    geom_point(data = pca_res %>% filter(Punctured != "other"), size=1.2) +
-    scale_color_manual(values = c( "grey95", "#A6DFF7"))+
-    theme(text = element_text(size=4),
-          legend.position = "top") +
-    guides(color = guide_legend(nrow=2))
-#put various volor designs together into one plot
-grid <-ggarrange(p5,p6,p7,p8, nrow=1)
+grid <-ggarrange(p1,p2,p3, nrow=1)
 
 grid
 # save plots
-save_plot(path(output_dir, "QC_plots/PCA/Filt_samples/cpms15/cpms15_2BMDC_or2T/PCA_controls.pdf"),
-          p10,dpi=90, base_aspect_ratio =1.2)
-save_plot(path(output_dir, "QC_plots/PCA/Filt_samples/cpms15/cpms15_2BMDC_or2T/Targettype_drugtype_DMSO_conc.pdf"),grid,base_aspect_ratio =4,dpi=90)
+save_plot(fs::path(output_dir, "QC/PCA/Filt/23samples_cpms10_PCA.pdf"),
+          grid,dpi=90, base_aspect_ratio =3)
+
 
 ```
 
