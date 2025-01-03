@@ -9,21 +9,21 @@ library(scales) #for sci notation
 
 # directories
 wd <- getwd()
-input_dir <- "/Volumes/nchevrier/projects/katej/projects/Bulk_mRNAseq/katej_12.24/STARSolo_Output/GeneFull/Filtered" # where bcbio output and meta data matrices live on project2 server
-output_dir <- path(wd, "2024_12_31_Nfeko/input/data/2_formatted_data")# where prepped data will live (metadata/counts csvs etc)
+input_dir <- "/Volumes/nchevrier/projects/katej/projects/Bulk_mRNAseq/katej_12.24_bcbiogenome/STARSolo_Output/GeneFull/Filtered" # where bcbio output and meta data matrices live on project2 server
+output_dir <- fs::path(wd, "2024_12_31_Nfeko/input/data/2_formatted_data/bcbio_genome")# where prepped data will live (metadata/counts csvs etc)
 
 ##read in sample info for de-multiplexing----
-sample_info <- read_xlsx(path(wd, "2024_12_31_Nfeko/input/other/20241218_nfeKO_rnaseq_sample_sheet.xlsx"))
+sample_info <- read_xlsx(fs::path(wd, "2024_12_31_Nfeko/input/other/20241218_nfeKO_rnaseq_sample_sheet.xlsx"))
 #create meta data table
 meta <- sample_info %>%
         separate(Sample_Name, into = c("Target", "Guide", "Replicate"), sep = "_", remove = F)
                  
 #read in counts matrices for DCs and T cells (combined matrix)---
 #read in tagcounts matrices
-counts = readMM(path(input_dir, 'matrix.mtx')) 
+counts = readMM(fs::path(input_dir, 'matrix.mtx')) 
 # add rownames and colnames
-rownames(counts) = read_lines(path(input_dir, 'features.tsv'))
-colnames(counts) = read_lines(path(input_dir, 'barcodes.tsv'))
+rownames(counts) = read_lines(fs::path(input_dir, 'features.tsv'))
+colnames(counts) = read_lines(fs::path(input_dir, 'barcodes.tsv'))
 
 #Shorten rownames to only gene name (remove ENSEMBL ID info)
 rownames(counts) = gsub(".*\t","",gsub("\tGene.*","",rownames(counts)))
@@ -47,15 +47,15 @@ meta_order = meta %>%
 NS_counts_order = NS_counts[,meta_order$Sample_Name]
   
 #save separate count & meta data in case its useful later----
-write.csv(as.matrix(NS_counts_order), path(output_dir, "20241231_Nfekoseq_counts.csv"))
-write.csv(as.matrix(meta_order), path(output_dir, "20241231_Nfekoseq__metadata.csv"))
+write.csv(as.matrix(NS_counts_order), fs::path(output_dir, "20241231_Nfekoseq_counts.csv"))
+write.csv(as.matrix(meta_order), fs::path(output_dir, "20241231_Nfekoseq__metadata.csv"))
 
 
 #----checking unfiltered matrix to see # of reads for unused barcodes
-counts_unfilt = readMM(path(input_dir, '../raw/matrix.mtx.gz')) 
+counts_unfilt = readMM(fs::path(input_dir, '../raw/matrix.mtx.gz')) 
 # add rownames and colnames
-rownames(counts_unfilt) = read_lines(path(input_dir, '../raw/features.tsv.gz'))
-colnames(counts_unfilt) = read_lines(path(input_dir, '../raw/barcodes.tsv.gz'))
+rownames(counts_unfilt) = read_lines(fs::path(input_dir, '../raw/features.tsv.gz'))
+colnames(counts_unfilt) = read_lines(fs::path(input_dir, '../raw/barcodes.tsv.gz'))
 
 #Shorten rownames to only gene name (remove ENSEMBL ID info)
 rownames(counts_unfilt) = gsub(".*\t","",gsub("\tGene.*","",rownames(counts_unfilt)))
@@ -80,4 +80,4 @@ p<-ggplot(read_sum, aes(x = Sample_Name, y = Reads)) +
   theme(axis.text.x = element_text(angle = 45, hjust =1))
 
 #reads might be too low to get meaninful DE data...
-save_plot(path(output_dir, "../../../output/QC/read_by_sample.pdf"), p)
+save_plot(fs::path(output_dir, "../../../../output/bcbio_genome/QC/read_by_sample.pdf"), p)
